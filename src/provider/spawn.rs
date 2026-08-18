@@ -119,6 +119,16 @@ impl AnyAgent {
         // loop's dispatch.
         let tool_defs = Self::tool_defs_for(&self.loop_tools);
 
+        // dirge-lean: capture the fresh-session check BEFORE `history` is
+        // moved into `rig_history_to_loop_messages` below, and pre-filter the
+        // core tool defs BEFORE `tool_defs` is moved into the fallback branch
+        // below — both values the lean arm block needs are gone by then.
+        let fresh_session = history.is_empty();
+        let lean_core_defs = crate::agent::agent_loop::lean::retain_core_tools(
+            &tool_defs,
+            crate::agent::agent_loop::lean::LEAN_CORE_TOOLS,
+        );
+
         // Phase-3: per-session loaded-tool set was allocated at
         // `build_agent` time (when `dynamic_tool_search` is on)
         // and the SAME Arc was passed both to the
@@ -209,6 +219,28 @@ impl AnyAgent {
         // user/assistant/toolResult shapes).
         let loop_history = rig_history_to_loop_messages(history);
 
+        // dirge-lean: arm the lean-first slot when the agent was built
+        // lean-eligible (DeepSeek chat family × config override) AND this is
+        // a FRESH session — empty rig history. A resume or a mid-session
+        // /agent /model rebuild always carries history, so only the very
+        // first spawn of a session can be lean. The lean stream fn is built
+        // from the core tool definitions only (`read`, `bash`); the
+        // dynamic-search filter is intentionally NOT shared with it — the
+        // dynamic loaded-set would re-expand the request's tools past the
+        // core (its whitelist logic unions ALWAYS_ON_TOOLS, which includes
+        // write/edit/grep/…). The slot self-disarms after request 1.
+        let lean_first = self
+            .lean_preamble
+            .as_ref()
+            .filter(|_| fresh_session)
+            .map(|lp| {
+                let lean_inner = self.build_stream_fn_with_filter(lean_core_defs.clone(), None);
+                crate::agent::agent_loop::lean::LeanFirst::new(
+                    Some(lp.clone()),
+                    retrying_stream_fn(lean_inner, RecoveryPolicy::default()),
+                )
+            });
+
         let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt.text.clone());
         cfg.system_prompt = system_prompt;
         cfg.history = loop_history;
@@ -218,6 +250,7 @@ impl AnyAgent {
         cfg.steering_queue = steering_queue;
         cfg.tool_def_filter = tool_def_filter;
         cfg.dynamic_tool_search = self.dynamic_tool_search;
+        cfg.lean_first = lean_first;
         cfg.turn_envelope = self.turn_envelope;
         cfg.prompt_leak_detect = self.prompt_leak_detect;
         // Fresh-paste images ride on the active turn; the loop seeds
@@ -540,6 +573,12 @@ impl AnyAgent {
         child_session_id: &str,
         max_turns: usize,
         model_override: Option<&AnyModel>,
+        // dirge-lean: the core tool NAMES (⊆ the tool set) visible on the
+        // subagent's first request; `None` keeps the pre-lean path. The lean
+        // system prompt is NOT swapped for subagents (`None` in LeanFirst) —
+        // their prompt is already the small persona text; only the tool
+        // surface narrows. Produced by `lean::resolving_lean_core`.
+        lean_core: Option<Vec<String>>,
     ) -> crate::agent::runner::AgentRunner {
         use crate::agent::agent_loop::{LoopSpawnConfig, retrying_stream_fn, spawn_loop_runner};
         use crate::agent::recovery::RecoveryPolicy;
@@ -549,15 +588,37 @@ impl AnyAgent {
             .map(AnyModel::provider_name)
             .unwrap_or_else(|| self.provider_name())
             .to_string();
+        // `tool_defs` is cloned into the match so the lean block below can
+        // filter it again for the request-1 core-only stream fn (dirge-lean).
         let inner_stream_fn = match model_override {
             Some(model) => model.build_stream_fn_with_filter(
-                tool_defs,
+                tool_defs.clone(),
                 self.chunk_timeout,
                 Some(provider.clone()),
                 None,
             ),
-            None => self.build_stream_fn(tool_defs),
+            None => self.build_stream_fn(tool_defs.clone()),
         };
+        // dirge-lean: a second stream fn restricted to the core tool defs,
+        // used only for request 1 (the loop disarms the slot right after).
+        let lean_first = lean_core.map(|core| {
+            let core_refs: Vec<&str> = core.iter().map(String::as_str).collect();
+            let core_defs =
+                crate::agent::agent_loop::lean::retain_core_tools(&tool_defs, &core_refs);
+            let lean_inner = match model_override {
+                Some(model) => model.build_stream_fn_with_filter(
+                    core_defs,
+                    self.chunk_timeout,
+                    Some(provider.clone()),
+                    None,
+                ),
+                None => self.build_stream_fn(core_defs),
+            };
+            crate::agent::agent_loop::lean::LeanFirst::new(
+                None,
+                retrying_stream_fn(lean_inner, RecoveryPolicy::default()),
+            )
+        });
         let mut cfg = LoopSpawnConfig::minimal(
             retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default()),
             prompt,
@@ -575,6 +636,7 @@ impl AnyAgent {
         };
         cfg.session_id = Some(child_session_id.to_string());
         cfg.max_turns = Some(max_turns);
+        cfg.lean_first = lean_first;
         spawn_loop_runner(cfg).into_agent_runner()
     }
 
@@ -607,6 +669,8 @@ impl AnyAgent {
         // `None` uses the live agent's model. Either way the TOOL SET comes
         // from the live agent (the parent's filtered registry).
         model_override: Option<&AnyModel>,
+        // dirge-lean: see `spawn_subagent_runner_with_tools`.
+        lean_core: Option<Vec<String>>,
     ) -> crate::agent::runner::AgentRunner {
         // Union the tier-capped built-in allow-list with the profile's MCP
         // selection. `resolve_mcp_selection` intersects the request with the
@@ -632,6 +696,7 @@ impl AnyAgent {
             child_session_id,
             max_turns,
             model_override,
+            lean_core,
         )
     }
 

@@ -203,8 +203,17 @@ pub async fn stream_assistant_response(
     //    function. Phase 4.6: StreamOptions carries all
     //    pi-parity provider knobs (reasoning, headers, metadata,
     //    request timeout).
+    let system_prompt = if let Some(lean) = &config.lean_first
+            && lean.is_armed()
+        {
+            lean.system_prompt
+                .clone()
+                .unwrap_or_else(|| context.system_prompt.clone())
+        } else {
+            context.system_prompt.clone()
+        };
     let llm_ctx = LlmContext {
-        system_prompt: context.system_prompt.clone(),
+        system_prompt,
         messages: llm_messages,
         asset_dir: config.asset_dir.clone(),
     };
@@ -250,6 +259,13 @@ pub async fn stream_assistant_response(
             .escalation_stream_fn
             .as_ref()
             .expect("checked Some above")
+    } else if let Some(lean) = &config.lean_first
+        && lean.is_armed()
+    {
+        // dirge-lean: request 1 of a fresh session — use the core-only
+        // stream fn (built from the `read`/`bash` tool defs) alongside the
+        // lean system prompt chosen above.
+        &lean.stream_fn
     } else {
         stream_fn
     };
@@ -621,6 +637,100 @@ mod tests {
             opts.metadata.get("user_id"),
             Some(&serde_json::json!("u42")),
         );
+    }
+
+    #[tokio::test]
+    async fn test_lean_first_request_uses_lean_prompt_and_lean_stream_then_full() {
+        // dirge-lean regression: request 1 of a fresh session ships the lean
+        // system prompt through the LEAN stream fn (core tools only); after
+        // the loop clears the slot (run.rs), request 2 ships the full
+        // preamble through the normal stream fn (full tool set).
+        use std::sync::Mutex;
+        fn tool_def(name: &str) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
+        }
+        fn recording_done_stream(sink: Arc<Mutex<Option<String>>>) -> StreamFn {
+            Arc::new(move |ctx: LlmContext, _opts: StreamOptions| {
+                *sink.lock().unwrap() = Some(ctx.system_prompt.clone());
+                let message = AssistantMessage::new(
+                    vec![ContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    StopReason::Stop,
+                );
+                Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                    usage: None,
+                }]))
+            })
+        }
+
+        let seen_normal = Arc::new(Mutex::new(None::<String>));
+        let seen_lean = Arc::new(Mutex::new(None::<String>));
+        let normal_fn = recording_done_stream(seen_normal.clone());
+        let lean_fn = recording_done_stream(seen_lean.clone());
+
+        let mut config = build_config(identity_converter());
+        config.lean_first = Some(crate::agent::agent_loop::lean::LeanFirst::new(
+            Some("LEAN-PREFIX".to_string()),
+            lean_fn,
+        ));
+
+        // Full registry as assembled at spawn. The lean request's stream fn is
+        // built from the core-only subset of this (production: spawn.rs); the
+        // regular stream fn keeps the full set. The loop's Context itself is
+        // never narrowed — the narrowing exists only at the stream boundary.
+        let full_defs = vec![
+            tool_def("list_dir"),
+            tool_def("read"),
+            tool_def("grep"),
+            tool_def("bash"),
+            tool_def("write"),
+        ];
+        let core_refs: Vec<&str> = crate::agent::agent_loop::lean::LEAN_CORE_TOOLS
+            .iter()
+            .copied()
+            .collect();
+        let core_defs =
+            crate::agent::agent_loop::lean::retain_core_tools(&full_defs, &core_refs);
+        assert_eq!(
+            core_defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["read", "bash"]
+        );
+
+        let full_preamble =
+            "FULL PREAMBLE — base + AGENTS.md + memory + persona + steering + projection"
+                .to_string();
+        let mut ctx = Context {
+            system_prompt: full_preamble.clone(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            tools: Vec::new(),
+        };
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
+
+        // First request: lean prompt through the lean stream fn.
+        stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
+            .await;
+        assert_eq!(seen_lean.lock().unwrap().as_deref(), Some("LEAN-PREFIX"));
+        assert_eq!(seen_normal.lock().unwrap().as_deref(), None);
+
+        // The loop clears the slot right after the first request (run.rs).
+        config.lean_first.as_ref().unwrap().clear();
+
+        // Second request: full preamble through the normal stream fn.
+        stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
+            .await;
+        assert_eq!(
+            seen_normal.lock().unwrap().as_deref(),
+            Some(full_preamble.as_str())
+        );
+        // The lean fn is never used again.
+        assert_eq!(seen_lean.lock().unwrap().as_deref(), Some("LEAN-PREFIX"));
     }
 
     #[tokio::test]

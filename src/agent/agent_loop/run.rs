@@ -3024,6 +3024,16 @@ pub async fn run_loop(
                 turn_tool_choice,
             )
             .await;
+            // dirge-lean: the session's first LLM request is served with the
+            // lean system prompt and the core tool set (`read`, `bash`).
+            // Disarm the slot right here — whatever happened (tool call or
+            // plain answer), every later request ships the full preamble and
+            // the full tool surface. The upgrade is permanent for the session,
+            // and a new spawn only happens with a non-empty history, which
+            // never re-arms the slot.
+            if let Some(lean) = &config.lean_first {
+                lean.clear();
+            }
             // Where this turn's assistant message sits in each transcript, so
             // a call scavenged out of its text can be recorded ON it further
             // down (dirge-n00z). Both are appended to below, so neither index

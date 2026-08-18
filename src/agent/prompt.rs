@@ -87,6 +87,25 @@ Respond in the same language the user writes to you.
 - When the user's request is genuinely ambiguous — multiple plausible paths, unclear scope, or load-bearing decisions you can't infer from the codebase — prefer the `question` tool over guessing. Phrase each question with concrete options (and mark a recommended option \"(Recommended)\" when you have a strong preference) rather than open-ended prose. Don't over-ask: skip the tool for choices that are clearly decidable from context.
 ";
 
+/// First paragraph of [`SYSTEM_PROMPT`] plus the trailing blank line — the
+/// portion a lean first request keeps, and the byte boundary where a
+/// lean-first session inserts [`LEAN_CORE_LINE`]. Kept as its own literal so
+/// the lean prefix is a verified byte-prefix of the full preamble (asserted in
+/// tests) rather than a magic offset into `SYSTEM_PROMPT`.
+pub const SYSTEM_PROMPT_OPEN: &str = "\
+You are an expert coding assistant. Help users with coding tasks by reading, writing, editing files and running commands.
+
+";
+
+/// One-line core-tool notice inserted after [`SYSTEM_PROMPT_OPEN`] in the
+/// preamble of a lean-first session. It is a PERMANENT part of the full
+/// preamble (not just the lean prefix), so the lean first request — which
+/// ships only the prefix — is a strict byte-prefix of every later request and
+/// the provider's prefix cache carries the head bytes across the upgrade.
+/// Phrased time-independently on purpose: it stays visible on later requests,
+/// where the capability projection below it shows the full tool list.
+pub const LEAN_CORE_LINE: &str = "Always available: read, bash.\n\n";
+
 /// The hand-written per-tool list that used to close [`SYSTEM_PROMPT`].
 ///
 /// Split out for dirge-e31n.3. It is a LITERAL: nothing reads the tool
@@ -364,6 +383,19 @@ mod tests {
         assert_ne!(
             preamble_digest("you are an agent"),
             preamble_digest("You are an agent")
+        );
+    }
+
+    /// Lean-first invariant: the opener is a byte-prefix of the full system
+    /// prompt, so a lean first request can be the exact head of every later
+    /// request — the provider's prefix cache then carries the lean bytes
+    /// across the upgrade instead of being invalidated at the swap point.
+    #[test]
+    fn system_prompt_opener_is_a_byte_prefix() {
+        assert!(
+            SYSTEM_PROMPT.starts_with(SYSTEM_PROMPT_OPEN),
+            "SYSTEM_PROMPT must start with SYSTEM_PROMPT_OPEN so a lean \
+             first request can be a strict byte-prefix of the full preamble"
         );
     }
 

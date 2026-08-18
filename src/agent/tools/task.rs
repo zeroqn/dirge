@@ -985,6 +985,19 @@ impl TaskTool {
             )
         })?;
 
+        // dirge-lean: subagent lean gate — `Some(core tool names)` when the
+        // subagent's model is lean-eligible (profile-pinned family, else the
+        // live agent's) AND `max_turns >= 2` AND `{read, bash} ∩ allowed` is
+        // non-empty. `None` runs the pre-lean path byte-for-byte.
+        let lean_core = crate::agent::agent_loop::lean::resolving_lean_core(
+            route_model.as_ref().map(|m| {
+                crate::agent::model_family::resolve_family(&m.provider_name(), &m.name())
+            }),
+            agent.lean_eligible(),
+            max_turns,
+            &allowed,
+        );
+
         if background {
             let running = self.bg_store.running_count();
             let cap = BackgroundStore::max_concurrent();
@@ -1149,6 +1162,7 @@ impl TaskTool {
             let ask_tx_for_task = self.ask_tx.clone();
             let sandbox_for_task = self.sandbox.clone();
             let rooted_worktree_for_task = rooted_worktree.clone();
+            let lean_core_for_task = lean_core.clone();
 
             let route_timeout = timeout;
             let store_for_task = store.clone();
@@ -1229,6 +1243,7 @@ impl TaskTool {
                         &child_sid,
                         max_turns,
                         model_for_task.as_ref(),
+                        lean_core_for_task,
                     )
                 } else {
                     agent.spawn_subagent_runner(
@@ -1239,6 +1254,7 @@ impl TaskTool {
                         &child_sid,
                         max_turns,
                         model_for_task.as_ref(),
+                        lean_core_for_task,
                     )
                 };
                 let abort_watcher = spawn_abort_watcher(
@@ -1354,6 +1370,7 @@ impl TaskTool {
                 &child_sid,
                 max_turns,
                 route_model.as_ref(),
+                lean_core,
             );
             let abort_watcher = spawn_abort_watcher(
                 abort.clone(),

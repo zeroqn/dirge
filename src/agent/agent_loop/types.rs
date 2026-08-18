@@ -596,6 +596,14 @@ pub struct LoopConfig {
     /// filter independently.
     pub dynamic_tool_search: bool,
 
+    /// dirge-lean: lean-first request slot. When `Some` and armed, the NEXT
+    /// LLM request ships the lean system prompt (a strict byte-prefix of the
+    /// full preamble) and a stream fn built from the core tool definitions
+    /// only (`read`, `bash`); the loop clears the slot right after that
+    /// request, so every later request uses the full preamble and the full
+    /// tool surface. `None` keeps the pre-lean path byte-for-byte identical.
+    pub lean_first: Option<super::lean::LeanFirst>,
+
     /// dirge-e31n.2: emit a per-turn `<turn_envelope>` carrying the volatile
     /// session facts (cwd, OS, shell, git branch) instead of freezing them
     /// into the system prompt. Mirrors the `turn_envelope` config knob. When
@@ -886,6 +894,10 @@ impl std::fmt::Debug for LoopConfig {
             )
             .field("dynamic_tool_search", &self.dynamic_tool_search)
             .field(
+                "lean_first",
+                &self.lean_first.as_ref().map(|l| l.is_armed()),
+            )
+            .field(
                 "escalation_stream_fn",
                 &self.escalation_stream_fn.as_ref().map(|_| "<fn>"),
             )
@@ -960,6 +972,7 @@ impl Clone for LoopConfig {
             truncation_notes: self.truncation_notes.clone(),
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
+            lean_first: self.lean_first.clone(),
             turn_envelope: false,
             prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: self.escalation_stream_fn.clone(),
@@ -1031,6 +1044,7 @@ impl LoopConfig {
             )),
             tool_def_filter: None,
             dynamic_tool_search: false,
+            lean_first: None,
             turn_envelope: false,
             prompt_leak_detect: GateMode::Off,
             escalation_stream_fn: None,

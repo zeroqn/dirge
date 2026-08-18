@@ -551,6 +551,7 @@ mod tests {
             std::time::Duration::from_secs(300),
             Vec::new(),
             String::new(),
+            None, // lean_preamble — test fixture
             "gpt-4o".to_string(),
         )
         .with_memory_provider(provider_dyn);

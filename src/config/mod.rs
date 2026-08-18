@@ -1286,6 +1286,20 @@ pub struct Config {
     /// `Available tools:` list.
     pub capability_projection: Option<bool>,
 
+    /// dirge-lean: ship a minimal system prompt + core tool set (`read`,
+    /// `bash`) on the first LLM request of a FRESH session, then restore the
+    /// full original preamble and full tool surface from request 2 on
+    /// (truncate-then-grow, never swap — the lean text is a strict byte-prefix
+    /// of the full preamble so the provider's prefix cache carries the lean
+    /// block across the upgrade). Ported from pi-deepseek-route's "first-turn
+    /// anchoring" to cut cold-cache overhead on DeepSeek v4 flash's first,
+    /// often-cheap exploration turn.
+    ///
+    /// - `null` (default): **auto** — enabled for DeepSeek chat models only.
+    /// - `true`: force on for every model family.
+    /// - `false`: force off.
+    pub lean_first_request: Option<bool>,
+
     /// dirge-e31n.6: detect a model that stops answering and starts reciting
     /// its own system prompt back at the user.
     ///
@@ -1890,6 +1904,12 @@ impl Config {
     /// of the tool set is rendered from the live catalog rather than a literal.
     pub fn resolve_capability_projection(&self) -> bool {
         self.capability_projection.unwrap_or(true)
+    }
+
+    /// Lean-first request (dirge-lean). Tri-state: `None` = auto (DeepSeek
+    /// chat family only), `Some(true)` / `Some(false)` = force on / off.
+    pub fn resolve_lean_first_request(&self) -> Option<bool> {
+        self.lean_first_request
     }
 
     /// Prompt-recitation detector (dirge-e31n.6). Default OFF. An

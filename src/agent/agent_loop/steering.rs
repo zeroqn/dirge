@@ -382,6 +382,7 @@ mod tests {
             )),
             tool_def_filter: None,
             dynamic_tool_search: false,
+            lean_first: None,
             turn_envelope: false,
             prompt_leak_detect: crate::agent::agent_loop::types::GateMode::Off,
             escalation_stream_fn: None,

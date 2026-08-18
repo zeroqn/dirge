@@ -19,7 +19,7 @@ use crate::context::ContextFiles;
 
 use super::{
     append_code_mode_guidance, append_memory_to_preamble, append_mode_reminder,
-    assemble_base_preamble, model_steering_fragment,
+    assemble_base_preamble_with_lean, model_steering_fragment,
 };
 
 // Post phase 4.5h-6 the rig `Agent` this builds is retained ONLY for its
@@ -41,6 +41,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // positive switching away).
     active_provider: &str,
     active_model: &str,
+    // Lean first request: when true, the base preamble inserts the core-tool
+    // line after the opener and the returned `Option<String>` carries the
+    // resulting lean prefix (a strict byte-prefix of the full preamble) for
+    // the session's first request. Decided by the caller (provider layer):
+    // the family gate, config override and fresh-session gate live there.
+    lean_enabled: bool,
 ) -> (
     Agent<M>,
     ToolCache,
@@ -51,6 +57,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // rig 0.41 made `Agent::preamble` private, so hand the assembled
     // system prompt back instead of reading it off the built agent.
     String,
+    // Lean-first: the system prompt shipped only on the session's first
+    // request (`SYSTEM_PROMPT_OPEN` + the core-tool line). `None` when the
+    // run is not lean-enabled.
+    Option<String>,
 ) {
     // The `plan_file`-keyed gate on edit/write/apply_patch was
     // removed: prompt-level tool restrictions now live in the
@@ -58,7 +68,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // at the permission-checker layer. Plan / review modes deny
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
-    let mut preamble = assemble_base_preamble(cfg.resolve_capability_projection());
+    let (mut preamble, lean_boundary) =
+        assemble_base_preamble_with_lean(cfg.resolve_capability_projection(), lean_enabled);
     append_code_mode_guidance(&mut preamble, cfg.resolve_code_mode_rubric());
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");
@@ -365,7 +376,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // `--no-tools`, collects MCP/semantic tools, and applies plugin hooks).
     // Attaching them here too only duplicated every tool construction and
     // double-collected MCP tools at startup [dirge-tfip].
-    (builder.build(), ToolCache::new(), memory_store, preamble)
+    let lean_preamble = lean_boundary.map(|b| preamble[..b].to_string());
+    (builder.build(), ToolCache::new(), memory_store, preamble, lean_preamble)
 }
 
 /// Wall-clock bound for the blocking SQLite loads in `build_agent_inner`

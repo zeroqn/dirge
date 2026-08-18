@@ -167,9 +167,25 @@ pub async fn build_agent(
             // `_agent` is the rig `Agent`. Nothing reads it any more —
             // dirge's own loop drives requests — but building it is what
             // assembles the preamble, so it stays until that is untangled.
-            let (_agent, cache, memory_provider, agent_preamble) =
-                builder::build_agent_inner($m, cli, cfg, context, &provider_name, &model_name)
-                    .await;
+            let lean_eligible = match cfg.resolve_lean_first_request() {
+                Some(force) => force,
+                None => {
+                    let family =
+                        crate::agent::model_family::resolve_family(&provider_name, &model_name);
+                    family.is_deepseek_chat()
+                }
+            };
+            let (_agent, cache, memory_provider, agent_preamble, lean_preamble) =
+                builder::build_agent_inner(
+                    $m,
+                    cli,
+                    cfg,
+                    context,
+                    &provider_name,
+                    &model_name,
+                    lean_eligible,
+                )
+                .await;
 
             // Phase 4.5h-6: also build the LoopTool registry the
             // new agent_loop path dispatches against. Tools share
@@ -274,6 +290,7 @@ pub async fn build_agent(
                 chunk_timeout,
                 loop_tools,
                 preamble,
+                lean_preamble,
                 model_name.clone(),
             );
             // #701: record MCP tool names so a tooled subagent's

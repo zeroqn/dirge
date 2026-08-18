@@ -281,6 +281,7 @@ fn build_openai_any_agent() -> AnyAgent {
         std::time::Duration::from_secs(300),
         Vec::new(),    // loop_tools — empty for test fixture
         String::new(), // preamble — empty for test fixture
+        None,   // lean_preamble — test fixture
         "gpt-4o".to_string(),
     )
 }

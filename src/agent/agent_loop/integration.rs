@@ -553,6 +553,13 @@ pub struct LoopSpawnConfig {
     /// insights every time. `None` is a no-op (no provider attached, or a
     /// non-interactive test path).
     pub memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+
+    /// dirge-lean: lean-first request slot. When `Some`, the FIRST LLM
+    /// request ships the lean system prompt + core-only stream fn (`read`,
+    /// `bash`); the loop clears it right after that request. `None` keeps the
+    /// pre-lean path byte-for-byte identical. Set only for the main agent and
+    /// for DeepSeek-family tooled subagents.
+    pub lean_first: Option<super::lean::LeanFirst>,
 }
 
 impl LoopSpawnConfig {
@@ -607,6 +614,7 @@ impl LoopSpawnConfig {
             max_tokens: None,
             bg_store: None,
             memory_provider: None,
+            lean_first: None,
         }
     }
 }
@@ -673,6 +681,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         )),
         tool_def_filter: cfg.tool_def_filter.clone(),
         dynamic_tool_search: cfg.dynamic_tool_search,
+        lean_first: cfg.lean_first.clone(),
         turn_envelope: cfg.turn_envelope,
         prompt_leak_detect: cfg.prompt_leak_detect,
         escalation_stream_fn: cfg.escalation_stream_fn.clone(),

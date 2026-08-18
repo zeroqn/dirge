@@ -79,6 +79,13 @@ pub struct AnyAgent {
     /// Returned by `build_agent_inner`, which assembles it. It used to be
     /// read back off the rig `Agent`, but rig 0.41 made that field private.
     preamble: String,
+    /// dirge-lean: the system prompt shipped only on the session's FIRST LLM
+    /// request (`SYSTEM_PROMPT_OPEN` + `LEAN_CORE_LINE` — a strict byte-prefix
+    /// of `preamble`) when the run is lean-eligible (DeepSeek chat family ×
+    /// config override); `None` otherwise. `spawn_runner` arms the lean slot
+    /// only when this is `Some` AND the session history is empty (fresh
+    /// session, not a resume or a mid-session rebuild).
+    lean_preamble: Option<String>,
     /// Model identifier — the same string the user passed via
     /// `--model` or pulled from config. Carried so `spawn_runner`
     /// can forward it into `LoopSpawnConfig::model_name` for the
@@ -377,12 +384,21 @@ impl AnyAgent {
         crate::agent::prompt::preamble_digest(&self.preamble)
     }
 
+    /// dirge-lean: whether this agent was built lean-eligible (DeepSeek chat
+    /// family × config override). Subagents that inherit the live agent's
+    /// model gate on this; the fresh-session condition is NOT part of it —
+    /// that lives at `spawn_runner`.
+    pub fn lean_eligible(&self) -> bool {
+        self.lean_preamble.is_some()
+    }
+
     pub fn new(
         inner: AnyAgentInner,
         cache: ToolCache,
         chunk_timeout: std::time::Duration,
         loop_tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
         preamble: String,
+        lean_preamble: Option<String>,
         model_name: String,
     ) -> Self {
         AnyAgent {
@@ -391,6 +407,7 @@ impl AnyAgent {
             chunk_timeout,
             loop_tools,
             preamble,
+            lean_preamble,
             model_name,
             dynamic_tool_search: false,
             turn_envelope: false,
