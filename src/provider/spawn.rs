@@ -124,6 +124,11 @@ impl AnyAgent {
         // core tool defs BEFORE `tool_defs` is moved into the fallback branch
         // below — both values the lean arm block needs are gone by then.
         let fresh_session = history.is_empty();
+        // DSH minimal first request: armed for fresh DeepSeek-chat sessions
+        // (built with `with_minimal_first`). Request 1 carries the exact DSH
+        // `minimal` contract; request 2+ appends Dirge's full preamble/tools
+        // after the minimal line (grow, never swap).
+        let minimal_active = self.minimal_first() && fresh_session;
         let lean_core_defs = crate::agent::agent_loop::lean::retain_core_tools(
             &tool_defs,
             crate::agent::agent_loop::lean::LEAN_CORE_TOOLS,
@@ -229,20 +234,42 @@ impl AnyAgent {
         // dynamic loaded-set would re-expand the request's tools past the
         // core (its whitelist logic unions ALWAYS_ON_TOOLS, which includes
         // write/edit/grep/…). The slot self-disarms after request 1.
-        let lean_first = self
-            .lean_preamble
-            .as_ref()
-            .filter(|_| fresh_session)
-            .map(|lp| {
-                let lean_inner = self.build_stream_fn_with_filter(lean_core_defs.clone(), None);
-                crate::agent::agent_loop::lean::LeanFirst::new(
-                    Some(lp.clone()),
-                    retrying_stream_fn(lean_inner, RecoveryPolicy::default()),
-                )
-            });
+        let lean_first = if minimal_active {
+            // DSH minimal: the lean slot carries the exact one-line persona
+            // and a stream fn whose tool definitions are EXACTLY the two DSH
+            // tools. The dynamic-search filter is intentionally NOT shared
+            // (same reasoning as the read/bash lean arm). The slot
+            // self-disarms after request 1, handing the session to the full
+            // stream fn + the grown system prompt below.
+            let dsh_inner = self.build_stream_fn_with_filter(
+                crate::agent::agent_loop::dsh_minimal::dsh_minimal_tool_defs(),
+                None,
+            );
+            Some(crate::agent::agent_loop::lean::LeanFirst::new(
+                Some(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT.to_string()),
+                retrying_stream_fn(dsh_inner, RecoveryPolicy::default()),
+            ))
+        } else {
+            self.lean_preamble
+                .as_ref()
+                .filter(|_| fresh_session)
+                .map(|lp| {
+                    let lean_inner = self.build_stream_fn_with_filter(lean_core_defs.clone(), None);
+                    crate::agent::agent_loop::lean::LeanFirst::new(
+                        Some(lp.clone()),
+                        retrying_stream_fn(lean_inner, RecoveryPolicy::default()),
+                    )
+                })
+        };
 
         let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt.text.clone());
-        cfg.system_prompt = system_prompt;
+        cfg.system_prompt = if minimal_active {
+            // Request 2+: the minimal line stays as a strict byte-prefix and
+            // Dirge's full preamble (plugin appends included) is appended.
+            crate::agent::agent_loop::dsh_minimal::dsh_minimal_full_prompt(&system_prompt)
+        } else {
+            system_prompt
+        };
         cfg.history = loop_history;
         cfg.tools = self.loop_tools;
         cfg.provider_name = Some(provider_name);

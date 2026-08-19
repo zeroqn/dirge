@@ -86,6 +86,13 @@ pub struct AnyAgent {
     /// only when this is `Some` AND the session history is empty (fresh
     /// session, not a resume or a mid-session rebuild).
     lean_preamble: Option<String>,
+    /// DSH-minimal first request: when set and the session is fresh, request 1
+    /// carries the exact DSH `minimal` preset contract instead of the
+    /// read-bash lean core — one-line persona plus exactly the two DSH tool
+    /// definitions. Request 2+ GROWS to the minimal line + Dirge's full
+    /// preamble and full tool set. Computed in `build_agent` (DeepSeek-chat
+    /// family × lean eligibility); consumed at `spawn_runner`.
+    minimal_first: bool,
     /// Model identifier — the same string the user passed via
     /// `--model` or pulled from config. Carried so `spawn_runner`
     /// can forward it into `LoopSpawnConfig::model_name` for the
@@ -392,6 +399,17 @@ impl AnyAgent {
         self.lean_preamble.is_some()
     }
 
+    /// DSH-minimal first request is armed for this agent (DeepSeek-chat
+    /// family × lean eligibility, computed in `build_agent`).
+    pub fn minimal_first(&self) -> bool {
+        self.minimal_first
+    }
+
+    pub fn with_minimal_first(mut self, v: bool) -> Self {
+        self.minimal_first = v;
+        self
+    }
+
     pub fn new(
         inner: AnyAgentInner,
         cache: ToolCache,
@@ -408,6 +426,7 @@ impl AnyAgent {
             loop_tools,
             preamble,
             lean_preamble,
+            minimal_first: false,
             model_name,
             dynamic_tool_search: false,
             turn_envelope: false,

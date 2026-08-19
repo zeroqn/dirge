@@ -734,6 +734,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_minimal_first_uses_dsh_prompt_then_grows_to_full() {
+        // DSH minimal first request ("option B"): request 1 of a fresh
+        // DeepSeek-chat session ships the exact DSH `minimal` system line
+        // through the lean stream fn; after the loop clears the slot (run.rs),
+        // request 2 ships the GROWN prompt (`minimal line\n\n` + full dirge
+        // preamble) through the normal stream fn. At spawn the lean stream fn
+        // is built from exactly `dsh_minimal_tool_defs()` (asserted in the
+        // dsh_minimal unit tests) and `Context.system_prompt` is set to
+        // `dsh_minimal_full_prompt(preamble)`, so the one-line persona stays a
+        // strict byte-prefix of every later request — never a swap.
+        use std::sync::Mutex;
+        fn recording_done_stream(sink: Arc<Mutex<Option<String>>>) -> StreamFn {
+            Arc::new(move |ctx: LlmContext, _opts: StreamOptions| {
+                *sink.lock().unwrap() = Some(ctx.system_prompt.clone());
+                let message = AssistantMessage::new(
+                    vec![ContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    StopReason::Stop,
+                );
+                Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                    usage: None,
+                }]))
+            })
+        }
+
+        let seen_normal = Arc::new(Mutex::new(None::<String>));
+        let seen_lean = Arc::new(Mutex::new(None::<String>));
+        let normal_fn = recording_done_stream(seen_normal.clone());
+        let lean_fn = recording_done_stream(seen_lean.clone());
+
+        let mut config = build_config(identity_converter());
+        config.lean_first = Some(crate::agent::agent_loop::lean::LeanFirst::new(
+            Some(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT.to_string()),
+            lean_fn,
+        ));
+
+        // The request-1 tool surface is EXACTLY the two DSH definitions —
+        // no Dirge extras leak into request 1.
+        let dsh_defs = crate::agent::agent_loop::dsh_minimal::dsh_minimal_tool_defs();
+        let dsh_names: Vec<&str> = dsh_defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(dsh_names, vec!["bash", "str_replace_editor"]);
+        assert_eq!(dsh_defs.len(), 2, "request 1 must expose exactly two tools");
+
+        let full_preamble =
+            "You are an expert coding assistant. Help the user with code.\n\nAGENTS.md context."
+                .to_string();
+        // At spawn, `Context.system_prompt` is set to the GROWN value:
+        // `dsh_minimal_full_prompt(preamble)`. The lean slot holds the exact
+        // DSH one-liner for request 1.
+        let grown =
+            crate::agent::agent_loop::dsh_minimal::dsh_minimal_full_prompt(&full_preamble);
+        let mut ctx = Context {
+            system_prompt: grown.clone(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            tools: Vec::new(),
+        };
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
+
+        // First request: exact DSH one-line persona through the lean stream fn.
+        stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
+            .await;
+        assert_eq!(
+            seen_lean.lock().unwrap().as_deref(),
+            Some(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT)
+        );
+        assert_eq!(seen_normal.lock().unwrap().as_deref(), None);
+
+        // The loop clears the slot right after the first request (run.rs).
+        config.lean_first.as_ref().unwrap().clear();
+
+        // Second request: the minimal line + Dirge's full preamble, with the
+        // minimal line preserved as a strict byte-prefix (grow, not swap).
+        stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
+            .await;
+        assert_eq!(seen_normal.lock().unwrap().as_deref(), Some(grown.as_str()));
+        assert!(seen_normal
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .starts_with(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT));
+    }
+
+    #[tokio::test]
     async fn test_emits_message_start_and_end() {
         let mut ctx = Context {
             system_prompt: "You are helpful.".to_string(),

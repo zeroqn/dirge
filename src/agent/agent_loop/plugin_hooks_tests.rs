@@ -78,6 +78,7 @@ fn build_config() -> LoopConfig {
         get_steering_messages: None,
         get_followup_messages: None,
         should_defer_finalization: None,
+        lean_first: None,
         reasoning: None,
         thinking_budgets: None,
         max_tokens: None,

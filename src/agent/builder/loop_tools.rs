@@ -693,6 +693,16 @@ pub async fn build_loop_tools(
         )
         .await,
     );
+    // DSH minimal preset's editor (`str_replace_editor`): view/create/
+    // str_replace/insert over the filesystem, with the exact DSH schema and
+    // message formats. Registered in every session so the minimal-first
+    // request (which exposes only `bash` + this tool) can actually dispatch
+    // it; mutating, so it forces Sequential on its own.
+    tools.push(std::sync::Arc::new(tools::StrReplaceEditorTool::with_cache(
+        permission.clone(),
+        ask_tx.clone(),
+        cache.clone(),
+    )));
     tools.push(
         wrap_bounded(
             tools::BashTool::with_cache(

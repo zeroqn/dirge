@@ -167,14 +167,21 @@ pub async fn build_agent(
             // `_agent` is the rig `Agent`. Nothing reads it any more —
             // dirge's own loop drives requests — but building it is what
             // assembles the preamble, so it stays until that is untangled.
+            let family = crate::agent::model_family::resolve_family(&provider_name, &model_name);
             let lean_eligible = match cfg.resolve_lean_first_request() {
                 Some(force) => force,
-                None => {
-                    let family =
-                        crate::agent::model_family::resolve_family(&provider_name, &model_name);
-                    family.is_deepseek_chat()
-                }
+                None => family.is_deepseek_chat(),
             };
+            // DSH minimal first request ("option B"): on DeepSeek-chat
+            // sessions the lean slot is re-armed with the exact DSH `minimal`
+            // preset contract — the one-line persona and exactly the two DSH
+            // tool definitions (`bash` + `str_replace_editor`) — instead of
+            // the read/bash core. Request 2+ GROWS to that line + Dirge's
+            // full preamble and tool set (never a swap), so the prefix cache
+            // and the DeepSeek internal-router behavior keep their stable
+            // first-block. The full preamble must not carry the lean core
+            // line in that case, hence `&& !minimal_eligible`.
+            let minimal_eligible = lean_eligible && family.is_deepseek_chat();
             let (_agent, cache, memory_provider, agent_preamble, lean_preamble) =
                 builder::build_agent_inner(
                     $m,
@@ -183,7 +190,7 @@ pub async fn build_agent(
                     context,
                     &provider_name,
                     &model_name,
-                    lean_eligible,
+                    lean_eligible && !minimal_eligible,
                 )
                 .await;
 
@@ -308,6 +315,7 @@ pub async fn build_agent(
             }
             agent = agent.with_turn_envelope(cfg.resolve_turn_envelope());
             agent = agent.with_prompt_leak_detect(cfg.resolve_prompt_leak_detect());
+            agent = agent.with_minimal_first(minimal_eligible);
             if let Some(ds) = dyn_search {
                 agent.with_dynamic_tool_search(ds.filter, ds.registry)
             } else {
