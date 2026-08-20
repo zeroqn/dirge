@@ -127,6 +127,33 @@ pub fn dsh_minimal_full_prompt(full_preamble: &str) -> String {
     format!("{DSH_MINIMAL_SYSTEM_PROMPT}\n\n{full_preamble}")
 }
 
+/// The placeholder Dirge substitutes for the user's real first message on
+/// request 1 of a fresh DeepSeek-chat session. The real message stays in the
+/// transcript and reaches the model on request 2 — the same request that
+/// first ships the full preamble and full tool set.
+pub const DSH_MINIMAL_HI_PLACEHOLDER: &str = "hi";
+
+/// Rewrite the FIRST user-role message's content to the `"hi"` placeholder,
+/// in place. A no-op when no user message is present; only the first one
+/// changes and later messages are untouched.
+///
+/// This is a WIRE-only rewrite applied to the per-request serialized message
+/// list in `stream_assistant_response` while the first-request slot is armed —
+/// `context.messages` (the transcript) is never touched, so the real first
+/// user message survives to request 2.
+pub(crate) fn rewrite_first_user_message(msgs: &mut [serde_json::Value]) -> bool {
+    if let Some(first) = msgs.iter_mut().find(|m| role(m) == "user") {
+        first["content"] = serde_json::Value::String(DSH_MINIMAL_HI_PLACEHOLDER.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+fn role(m: &serde_json::Value) -> &str {
+    m.get("role").and_then(serde_json::Value::as_str).unwrap_or("")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +242,41 @@ mod tests {
         let second = dsh_minimal_full_prompt("more");
         assert!(second.starts_with(full.split_once('\n').unwrap().0));
         assert_eq!(second, "You are a helpful software engineer assistant.\n\nmore");
+    }
+
+    #[test]
+    fn rewrite_first_user_message_replaces_only_the_first_user_message() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "user", "content": "real first message"}),
+            serde_json::json!({"role": "assistant", "content": "Hi! How can I help?"}),
+            serde_json::json!({"role": "user", "content": "a later injected note"}),
+        ];
+        let changed = rewrite_first_user_message(&mut msgs);
+        assert!(changed);
+        assert_eq!(msgs[0]["content"], serde_json::json!(DSH_MINIMAL_HI_PLACEHOLDER));
+        // Only the first user message changes; the rest stay untouched.
+        assert_eq!(msgs[1]["content"], serde_json::json!("Hi! How can I help?"));
+        assert_eq!(msgs[2]["content"], serde_json::json!("a later injected note"));
+    }
+
+    #[test]
+    fn rewrite_first_user_message_handles_multipart_content() {
+        // A multipart (e.g. image) first user message also becomes "hi" on the
+        // wire; the real part array lives only in the transcript.
+        let mut msgs = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "look at this"},
+                        {"type": "image", "source": {"type": "base64", "data": "..."}}]
+        })];
+        let changed = rewrite_first_user_message(&mut msgs);
+        assert!(changed);
+        assert_eq!(msgs[0]["content"], serde_json::json!(DSH_MINIMAL_HI_PLACEHOLDER));
+    }
+
+    #[test]
+    fn rewrite_first_user_message_is_noop_without_a_user_message() {
+        let mut msgs = vec![serde_json::json!({"role": "assistant", "content": "hello"})];
+        assert!(!rewrite_first_user_message(&mut msgs));
+        assert_eq!(msgs[0]["content"], serde_json::json!("hello"));
     }
 }

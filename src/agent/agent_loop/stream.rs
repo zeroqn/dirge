@@ -182,7 +182,7 @@ pub async fn stream_assistant_response(
     };
 
     // 2. convertToLlm (required, AgentMessage[] → Message[])
-    let llm_messages = (config.convert_to_llm)(&messages);
+    let mut llm_messages = (config.convert_to_llm)(&messages);
 
     // 3. getApiKey (optional dynamic resolution) — receives the
     // provider name so a single hook implementation can dispatch
@@ -206,6 +206,14 @@ pub async fn stream_assistant_response(
     let system_prompt = if let Some(lean) = &config.lean_first
             && lean.is_armed()
         {
+            // dirge-lean / DSH-minimal: request 1 of a fresh session. The
+            // lean system prompt AND the user's real first message are both
+            // deferred to request 2 — the placeholder `"hi"` goes on the wire
+            // now, so the model greets without a tool call and the real first
+            // user message arrives with the full preamble + full tool set on
+            // request 2. `context.messages` is never touched; this rewrites
+            // only the per-request serialized copy.
+            super::dsh_minimal::rewrite_first_user_message(&mut llm_messages);
             lean.system_prompt
                 .clone()
                 .unwrap_or_else(|| context.system_prompt.clone())
@@ -745,9 +753,24 @@ mod tests {
         // `dsh_minimal_full_prompt(preamble)`, so the one-line persona stays a
         // strict byte-prefix of every later request — never a swap.
         use std::sync::Mutex;
-        fn recording_done_stream(sink: Arc<Mutex<Option<String>>>) -> StreamFn {
+        // Captures the system prompt AND the first user message's content seen
+        // on each request's WIRE payload (post-rewrite), so we can assert the
+        // `"hi"` placeholder goes on request 1 and the real message on request 2.
+        #[derive(Default)]
+        struct Seen {
+            system_prompt: Option<String>,
+            first_user_content: Option<serde_json::Value>,
+        }
+        fn recording_done_stream(sink: Arc<Mutex<Seen>>) -> StreamFn {
             Arc::new(move |ctx: LlmContext, _opts: StreamOptions| {
-                *sink.lock().unwrap() = Some(ctx.system_prompt.clone());
+                let mut s = sink.lock().unwrap();
+                s.system_prompt = Some(ctx.system_prompt.clone());
+                s.first_user_content = ctx
+                    .messages
+                    .iter()
+                    .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+                    .map(|m| m.get("content").cloned().unwrap_or(serde_json::Value::Null));
+                drop(s);
                 let message = AssistantMessage::new(
                     vec![ContentBlock::Text {
                         text: "ok".to_string(),
@@ -762,8 +785,8 @@ mod tests {
             })
         }
 
-        let seen_normal = Arc::new(Mutex::new(None::<String>));
-        let seen_lean = Arc::new(Mutex::new(None::<String>));
+        let seen_normal = Arc::new(Mutex::new(Seen::default()));
+        let seen_lean = Arc::new(Mutex::new(Seen::default()));
         let normal_fn = recording_done_stream(seen_normal.clone());
         let lean_fn = recording_done_stream(seen_lean.clone());
 
@@ -788,36 +811,55 @@ mod tests {
         // DSH one-liner for request 1.
         let grown =
             crate::agent::agent_loop::dsh_minimal::dsh_minimal_full_prompt(&full_preamble);
+        let real_first_message = "implement the feature in src/main.rs";
         let mut ctx = Context {
             system_prompt: grown.clone(),
-            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            messages: vec![serde_json::json!({"role": "user", "content": real_first_message})],
             tools: Vec::new(),
         };
         let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
 
-        // First request: exact DSH one-line persona through the lean stream fn.
+        // First request: exact DSH one-line persona through the lean stream fn,
+        // with the REAL first user message replaced on the wire by "hi".
         stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
             .await;
         assert_eq!(
-            seen_lean.lock().unwrap().as_deref(),
+            seen_lean.lock().unwrap().system_prompt.as_deref(),
             Some(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT)
         );
-        assert_eq!(seen_normal.lock().unwrap().as_deref(), None);
+        assert_eq!(seen_normal.lock().unwrap().system_prompt.as_deref(), None);
+        assert_eq!(
+            seen_lean.lock().unwrap().first_user_content,
+            Some(serde_json::json!(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_HI_PLACEHOLDER)),
+            "request 1 must ship the 'hi' placeholder, not the real first message"
+        );
+        // The transcript is untouched — the real first message is still there.
+        assert_eq!(
+            ctx.messages[0]["content"],
+            serde_json::json!(real_first_message)
+        );
 
         // The loop clears the slot right after the first request (run.rs).
         config.lean_first.as_ref().unwrap().clear();
 
         // Second request: the minimal line + Dirge's full preamble, with the
-        // minimal line preserved as a strict byte-prefix (grow, not swap).
+        // minimal line preserved as a strict byte-prefix (grow, not swap), and
+        // the REAL first user message now reaching the model.
         stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &normal_fn, None)
             .await;
-        assert_eq!(seen_normal.lock().unwrap().as_deref(), Some(grown.as_str()));
+        assert_eq!(seen_normal.lock().unwrap().system_prompt.as_deref(), Some(grown.as_str()));
         assert!(seen_normal
             .lock()
             .unwrap()
+            .system_prompt
             .as_deref()
             .unwrap()
             .starts_with(crate::agent::agent_loop::dsh_minimal::DSH_MINIMAL_SYSTEM_PROMPT));
+        assert_eq!(
+            seen_normal.lock().unwrap().first_user_content,
+            Some(serde_json::json!(real_first_message)),
+            "request 2 must carry the real first user message"
+        );
     }
 
     #[tokio::test]
