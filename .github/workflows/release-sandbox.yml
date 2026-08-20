@@ -1,0 +1,57 @@
+name: Release (sandbox)
+
+on:
+  push:
+    branches:
+      - deepseek
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: x86_64-unknown-linux-gnu (sandbox)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      # libkrun must be built from source: upstream releases ship no prebuilt
+      # .so assets. The runner links -lkrun and dirge's build.rs probes for
+      # libkrun.so to decide whether to emit `krun_linked` (real runner vs
+      # stub). Build deps: make, gcc (for init.c), patchelf (for install),
+      # and static libc (init links -static) — all available on ubuntu-latest.
+      # libkrunfw is NOT needed at build time: libkrun dlopens it at runtime.
+      - name: Build libkrun from source
+        run: |
+          sudo apt-get update && sudo apt-get install -y make gcc patchelf
+          git clone --depth 1 --branch v1.19.4 \
+            https://github.com/libkrun/libkrun /tmp/libkrun
+          cd /tmp/libkrun
+          make install PREFIX=/tmp/krun
+          echo "LIBKRUN_LIB_DIR=/tmp/krun/lib64" >> "$GITHUB_ENV"
+
+      - name: Build dirge (sandbox-microvm)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu \
+            --features sandbox-microvm
+
+      - name: Package
+        run: |
+          archive=dirge-x86_64-unknown-linux-gnu-sandbox.tar.gz
+          stag=target/x86_64-unknown-linux-gnu/release
+          tar czf "$archive" -C "$stag" dirge dirge-microvm-runner
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Upload release assets
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dirge-x86_64-unknown-linux-gnu-sandbox.tar.gz*
+          file_glob: true
+          tag: ds-sandbox
+          overwrite: true

@@ -23,10 +23,17 @@
     in
     {
       packages = forAllSystems (
-        { pkgs, ... }:
+        { system, pkgs }:
         rec {
           dirge = pkgs.callPackage ./nix/package.nix { src = self; };
-          dirge-bin = pkgs.callPackage ./nix/bin.nix { };
+          # x86_64-linux: forked prebuilt with the microVM sandbox enabled
+          # (zeroqn/dirge rolling `ds-sandbox` release, built by
+          # .github/workflows/release-sandbox.yml). Other systems keep the
+          # upstream prebuilt (no microVM support).
+          dirge-bin =
+            if system == "x86_64-linux"
+            then pkgs.callPackage ./nix/bin-sandbox.nix { }
+            else pkgs.callPackage ./nix/bin.nix { };
           default = dirge;
         }
       );
@@ -64,7 +71,11 @@
 
       overlays.default = final: prev: {
         dirge = final.callPackage ./nix/package.nix { src = self; };
-        dirge-bin = final.callPackage ./nix/bin.nix { };
+        # Same x86_64-linux override as `packages.dirge-bin` above.
+        dirge-bin =
+          if final.stdenv.hostPlatform.system == "x86_64-linux"
+          then final.callPackage ./nix/bin-sandbox.nix { }
+          else final.callPackage ./nix/bin.nix { };
       };
     };
 }
