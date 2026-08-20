@@ -32,6 +32,9 @@ jobs:
           git clone --depth 1 --branch v1.19.4 \
             https://github.com/libkrun/libkrun /tmp/libkrun
           cd /tmp/libkrun
+          # libkrun's `install` target does not depend on `all`: build the
+          # library first, then install it.
+          make -j"$(nproc)" PREFIX=/tmp/krun
           make install PREFIX=/tmp/krun
           echo "LIBKRUN_LIB_DIR=/tmp/krun/lib64" >> "$GITHUB_ENV"
 
