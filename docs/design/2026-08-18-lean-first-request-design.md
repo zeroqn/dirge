@@ -1,6 +1,7 @@
 # Lean First Request — design
 
-> Date: 2026-08-18 · Status: approved (design summary; doc written after user approval) · Feature: `lean-first-request`
+> Date: 2026-08-18 · Status: approved & implemented (design summary; doc written after user approval) · Feature: `lean-first-request`
+> **Superseded for DeepSeek-chat sessions by commit `0565e674` (DSH-minimal).** The original `read`/`bash` contract described below still applies to forced-on non-DeepSeek sessions (via `lean_first_request: true`) and as the tool-narrowing half of tooled subagents; on fresh DeepSeek-chat sessions request 1 now ships the exact DeepSeek Harness `minimal` preset contract instead — see §14.
 
 ## 1. Motivation
 
@@ -127,3 +128,34 @@ The code deliberately deviates from the §7 wiring sketch in a few places. Each 
 - **`retain_core_tools` lives in `lean.rs`** — §7 placed it in `rig_stream_factory.rs`. Deny and allow filtering happens upstream (the handed-in registry is already deny-filtered; the subagent gate intersects core with `allowed`), so the helper only narrows within the already-legal set; its tests cover intersection, order stability, and empty registry/empty core.
 - **Escalation on request 1** — §8 offered "skip lean on escalation" as an option "if wiring is inconvenient". Implemented inverse: the escalation stream fn takes precedence over the lean one, but the lean system prompt still applies if the escalation happens on request 1 (the slot is a request-1 property). The fallback model sees a valid request-1 payload; the full prompt returns on request 2. Not a deviation from any §9 acceptance criterion.
 - **Subagent prompts** — §6's "request 1 gets the lean prefix" applies to tooled subagents as tool narrowing only: a subagent's system prompt is already the small persona text, so `system_prompt: None` keeps the normal loop prompt for every request and only the tool surface narrows (guards: own family × `max_turns >= 2` × non-empty `{read,bash} ∩ allowed`, computed by `resolving_lean_core` in `lean.rs`, applied in `task.rs::run_tooled`).
+
+## 14. DSH-minimal supersession (commit `0565e674`)
+
+> Recorded 2026-08-19 after `feat(agent): DSH-minimal first request for fresh DeepSeek sessions`. This commit changes the request-1 contract for **fresh DeepSeek-chat sessions** from the §3/§5 `read`-`bash` cut to the exact DeepSeek Harness `minimal` preset contract. It rides the same `LeanFirst` slot (§13), so the slot lifecycle, the stream boundary, and the truncate-then-grow invariant are unchanged — only WHAT request 1 carries on DeepSeek-chat changes.
+
+### 14.1 The DSH-minimal request-1 contract
+
+On a fresh DeepSeek-chat session, request 1 now ships:
+
+- **System prompt** = exactly `"You are a helpful software engineer assistant."` (`DSH_MINIMAL_SYSTEM_PROMPT` in `dsh_minimal.rs`) — not the base opener + core-tool line of §3.
+- **Tool surface** = exactly `bash` + `str_replace_editor` (`dsh_minimal_tool_defs()`), byte-identical DSH descriptions/schemas. `str_replace_editor` is a faithful port of the DSH editor (view/create/str_replace/insert, exact result/error strings, 16000-char `<response clipped>` truncation, non-overlapping match semantics) added in `str_replace_editor.rs` and registered unconditionally in the main loop registry (`loop_tools.rs`), so both request 1 and later requests can dispatch it. Mutations route through Dirge's permission / atomic-write / snapshot / cache layers.
+
+### 14.2 Growth, not swap
+
+Request 2+ sets `Context.system_prompt` to `dsh_minimal_full_prompt(preamble)` = `DSH_MINIMAL_SYSTEM_PROMPT "\n\n" full_preamble`. The one-line persona is a strict byte-prefix of every later request, so the provider prefix cache (and the DeepSeek internal router) keep a stable first block — the exact truncate-then-grow invariant of §3.2, with the minimal line as the new boundary.
+
+### 14.3 Gating and interaction with the original lean path
+
+- `minimal_eligible = lean_eligible && family.is_deepseek_chat()` (`provider/build.rs`). When armed, the original lean `read`/`bash` preamble is **suppressed** (`lean_eligible && !minimal_eligible` is passed to `build_agent_inner`, whose lean core-tool line would otherwise appear inside the grown preamble and break the prefix), and `Context.system_prompt` is set to the grown prompt.
+- The original §3/§5 `read`/`bash` contract still applies to **forced-on non-DeepSeek sessions** (`lean_first_request: true`, `minimal_eligible` false) and, as tool narrowing only, to tooled subagents (`system_prompt: None` — a subagent's persona is already the small prompt text, unchanged).
+- **Unchanged by the commit:** worktrees, subagents, and non-DeepSeek models (per the commit message "Worktree/subagents and non-DeepSeek models unchanged"); the `LeanFirst` armed-slot lifecycle and its clear site (`run.rs:3001-3003`); the wire-contract property that request 1 uses the lean stream fn and request 2+ the full stream fn.
+
+### 14.4 Tests added
+
+- `dsh_minimal.rs` unit tests: byte-exact `DSH_MINIMAL_SYSTEM_PROMPT`, exactly the two tool defs in order, verbatim descriptions/schemas, `dsh_minimal_full_prompt` keeping the one-liner as a byte prefix.
+- `str_replace_editor.rs`: DSH editor behavior port tests.
+- `stream.rs::test_minimal_first_uses_dsh_prompt_then_grows_to_full`: request 1 wire = the exact one-liner through the lean stream fn; request 2 = the grown prompt with the minimal line preserved as prefix.
+
+### 14.5 Relationship to this doc's earlier sections
+
+Sections §1-§13 remain valid as the design record of the original lean-first mechanism and now describe the non-DeepSeek / subagent-tool-narrowing path. For DeepSeek-chat sessions, read §14 as the current request-1 contract and treat §3.3 / §5 / §6's "request 1 = read/bash" statements as superseded by §14.1-§14.3. The `lean_first_request` config key, fresh-session gate, and §8 edge cases all still hold unchanged.
