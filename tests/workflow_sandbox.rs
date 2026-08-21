@@ -5,24 +5,37 @@
 //! the shared library and the workflow step fails with
 //! `install: cannot stat 'target/release/libkrun.so.1.19.4'`. The workflow
 //! must run `make` (the `all` target) before `make install`.
+//!
+//! The step must also provide libclang: libkrun's own cargo build runs
+//! bindgen (libkrunfw-sys), and dirge's default-features build runs bindgen
+//! too (janetrs). clang-sys panics when no `libclang.so` is available.
 
 use std::fs;
 
-#[test]
-fn libkrun_step_builds_before_install() {
-    let workflow = fs::read_to_string(concat!(
+fn workflow() -> String {
+    fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/release-sandbox.yml"
     ))
-    .expect("read release-sandbox.yml");
+    .expect("read release-sandbox.yml")
+}
 
-    let step = workflow
+/// Body of the `Build libkrun from source` step: everything between its
+/// `- name:` header and the next step's.
+fn libkrun_step(workflow: &str) -> &str {
+    workflow
         .split("- name: Build libkrun from source")
         .nth(1)
         .expect("workflow has a libkrun build step")
         .split("\n- name:")
         .next()
-        .expect("libkrun build step body");
+        .expect("libkrun build step body")
+}
+
+#[test]
+fn libkrun_step_builds_before_install() {
+    let workflow = workflow();
+    let step = libkrun_step(&workflow);
 
     let build = step
         .lines()
@@ -40,5 +53,19 @@ fn libkrun_step_builds_before_install() {
         build < install,
         "`make` must run before `make install`: libkrun's install target \
          does not depend on `all`, so it never builds the shared library"
+    );
+}
+
+#[test]
+fn libkrun_step_provides_libclang_for_bindgen() {
+    let workflow = workflow();
+    let step = libkrun_step(&workflow);
+
+    let provides = step.contains("libclang-dev") || step.contains("LIBCLANG_PATH");
+    assert!(
+        provides,
+        "libkrun's cargo build (and dirge's default features) run bindgen; \
+         without libclang-dev or LIBCLANG_PATH, clang-sys fails with \
+         `couldn't find any valid shared libraries matching: ['libclang.so', ...]`"
     );
 }

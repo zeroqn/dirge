@@ -28,7 +28,7 @@ jobs:
       # libkrunfw is NOT needed at build time: libkrun dlopens it at runtime.
       - name: Build libkrun from source
         run: |
-          sudo apt-get update && sudo apt-get install -y make gcc patchelf
+          sudo apt-get update && sudo apt-get install -y make gcc patchelf libclang-dev
           git clone --depth 1 --branch v1.19.4 \
             https://github.com/libkrun/libkrun /tmp/libkrun
           cd /tmp/libkrun
