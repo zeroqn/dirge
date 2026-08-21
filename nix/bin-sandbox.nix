@@ -3,13 +3,14 @@
   stdenv,
   fetchurl,
   autoPatchelfHook,
+  libkrun,
 }:
 
 let
   # Rolling tag updated on every push to the `deepseek` branch by
   # .github/workflows/release-sandbox.yml. The asset URL is stable; the
-  # hash below must be refreshed from `nix store prefetch-file` whenever the
-  # artifact is re-uploaded.
+  # hash in `src` is rewritten automatically by the same workflow after
+  # each upload.
   version = "0.24.0";
   repo = "zeroqn/dirge";
   tag = "ds-sandbox";
@@ -21,14 +22,20 @@ stdenv.mkDerivation {
 
   src = fetchurl {
     url = "https://github.com/${repo}/releases/download/${tag}/dirge-${triple}-sandbox.tar.gz";
-    # PLACEHOLDER — replace after the first workflow run:
-    #   nix store prefetch-file --hash-type sha256 <url>
-    hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    # Hash of the artifact uploaded by the last ds-sandbox workflow run;
+    # rewritten by .github/workflows/release-sandbox.yml after each upload.
+    hash = "sha256-HTG7pei6I+TaWIFjpzA+uTMITKvyuW85IpXDqXvhkq4=";
   };
 
   nativeBuildInputs = lib.optionals stdenv.isLinux [ autoPatchelfHook ];
 
-  buildInputs = lib.optionals stdenv.isLinux [ stdenv.cc.cc.lib ];
+  # dirge-microvm-runner links -lkrun at build time and needs libkrun.so.1 at
+  # runtime; libkrun dlopens libkrunfw.so, which rides along in libkrun's
+  # Nix closure. autoPatchelfHook resolves libkrun.so.1 from this input.
+  buildInputs = lib.optionals stdenv.isLinux [
+    stdenv.cc.cc.lib
+    libkrun
+  ];
 
   dontBuild = true;
   sourceRoot = ".";

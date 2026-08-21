@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history so the post-build commit can rebase+push back to
+          # `deepseek` (same rationale as the release.yml nix bump job).
+          fetch-depth: 0
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -58,3 +62,47 @@ jobs:
           file_glob: true
           tag: ds-sandbox
           overwrite: true
+
+      # Rolling tag: the `ds-sandbox` asset is overwritten on every push to
+      # `deepseek`, so the fixed-output hash in nix/bin-sandbox.nix must
+      # track the tarball just uploaded. The artifact was built in this job,
+      # so compute the SRI hash locally instead of `nix store prefetch-file`.
+      - name: Update nix/bin-sandbox.nix
+        run: |
+          set -euo pipefail
+          archive=dirge-x86_64-unknown-linux-gnu-sandbox.tar.gz
+          HASH="sha256-$(openssl dgst -sha256 -binary "$archive" | base64 -w0)"
+          HASH="$HASH" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("nix/bin-sandbox.nix")
+          text = path.read_text()
+          text = re.sub(
+              r'hash = "sha256-[A-Za-z0-9+/=]+";',
+              f'hash = "{os.environ["HASH"]}";',
+              text,
+              count=1,
+          )
+          path.write_text(text)
+          PY
+
+      # Commit the bump back to `deepseek`. A GITHUB_TOKEN push doesn't
+      # re-trigger workflows, so this can't loop the build. `deepseek` is
+      # unprotected; if branch protection is added later this needs a PAT.
+      - name: Commit nix/bin-sandbox.nix bump
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- nix/bin-sandbox.nix; then
+            echo "nix/bin-sandbox.nix already current — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/bin-sandbox.nix
+          git commit -m "Bump Nix dirge-bin-sandbox hash to ${GITHUB_SHA::8}"
+          # The workflow runs on every push to `deepseek`; rebase on any
+          # movement since checkout so the push fast-forwards.
+          git pull --rebase origin deepseek
+          git push origin HEAD:deepseek
