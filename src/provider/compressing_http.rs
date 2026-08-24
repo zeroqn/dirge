@@ -237,9 +237,36 @@ impl<Inner> CompressingHttpClient<Inner> {
         T: Into<Bytes>,
     {
         let (parts, body) = req.into_parts();
-        let body: Bytes = body.into();
-        let body = self.maybe_compress(body);
-        let body = self.rewrite_provider_quirks(body);
+        let original: Bytes = body.into();
+        let mut wire = self.maybe_compress(original.clone());
+        wire = self.rewrite_provider_quirks(wire);
+        // Post-compression structural validation. rig's typed `Message`
+        // serialization guarantees the pre-compression body is an array of
+        // role-bearing objects, so a violation here means a transform
+        // corrupted the request shape — the failure class behind DeepSeek's
+        // `'str' object has no attribute 'items'` 400001. `maybe_compress`
+        // fails open on errors, but a SILENT shape corruption would still
+        // reach the provider; fail safe instead by falling back to the
+        // original body. When the original is invalid too, compression is
+        // exonerated and the warn below is the upstream diagnosis (message
+        // assembly, not llmtrim).
+        if let Some(path) = structural_validation_failure(&wire) {
+            let fallback = self.rewrite_provider_quirks(original);
+            if structural_validation_failure(&fallback).is_none() {
+                tracing::warn!(
+                    target: "dirge::compression",
+                    bad = %path,
+                    "compressed request body failed structural validation — sending the original uncompressed body instead"
+                );
+                wire = fallback;
+            } else {
+                tracing::warn!(
+                    target: "dirge::provider",
+                    bad = %path,
+                    "request body is structurally invalid even before compression — the 400 originates upstream of llmtrim, in message assembly"
+                );
+            }
+        }
         let mut builder = Request::builder()
             .method(parts.method)
             .uri(parts.uri)
@@ -247,8 +274,40 @@ impl<Inner> CompressingHttpClient<Inner> {
         if let Some(headers) = builder.headers_mut() {
             *headers = parts.headers;
         }
-        builder.body(body).map_err(http_client::Error::Protocol)
+        builder.body(wire).map_err(http_client::Error::Protocol)
     }
+}
+
+/// Structural validation of a chat-request body, applied AFTER compression
+/// (and the backend quirks pass). rig's typed `Message` serialization
+/// produces `messages` as an array of objects each carrying a string `role`
+/// by construction, so any violation means a transform corrupted the shape —
+/// the failure class behind DeepSeek's `'str' object has no attribute
+/// 'items'` 400001. Returns the offending JSON pointer, or `None` when the
+/// body is well-formed.
+///
+/// Deliberately narrow: only the message-level invariants providers enforce
+/// are checked. Content shapes vary by backend and version (a multipart
+/// turn legitimately serializes as an array mixing bare text strings with
+/// object blocks), so they are out of scope — a false positive would
+/// silently disable compression on a healthy request. Bodies without a
+/// `messages` field (embeddings, model listing, Responses API `input`) and
+/// non-JSON bodies are skipped, not flagged.
+fn structural_validation_failure(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = value.as_object()?.get("messages")?;
+    let Some(entries) = messages.as_array() else {
+        return Some("/messages".to_string());
+    };
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(message) = entry.as_object() else {
+            return Some(format!("/messages/{i}"));
+        };
+        if !matches!(message.get("role"), Some(serde_json::Value::String(_))) {
+            return Some(format!("/messages/{i}/role"));
+        }
+    }
+    None
 }
 
 /// Outcome of a [`StreamingWithHeaders`] send: the rig-shaped result, plus the
@@ -673,6 +732,62 @@ mod tests {
         // DeepSeek non-JSON passes through like every other backend.
         let raw = Bytes::from_static(b"not json at all");
         assert_eq!(deepseek_client().rewrite_provider_quirks(raw.clone()), raw);
+    }
+
+    // ---- Post-compression structural validation ----
+
+    /// A `messages` entry that is a bare string is exactly the shape DeepSeek
+    /// rejects with `'str' object has no attribute 'items'` (400001). The
+    /// guard must flag it so `normalized_request` falls back to the original
+    /// body instead of shipping a guaranteed-400 request.
+    #[test]
+    fn structural_validation_flags_a_string_in_messages() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"},"oops"]}"#;
+        assert_eq!(
+            super::structural_validation_failure(body).as_deref(),
+            Some("/messages/1")
+        );
+    }
+
+    #[test]
+    fn structural_validation_flags_a_string_messages_field() {
+        let body = br#"{"messages":"oops"}"#;
+        assert_eq!(
+            super::structural_validation_failure(body).as_deref(),
+            Some("/messages")
+        );
+    }
+
+    #[test]
+    fn structural_validation_flags_a_message_without_role() {
+        let body = br#"{"messages":[{"content":"hi"},{"role":"user","content":"ok"}]}"#;
+        assert_eq!(
+            super::structural_validation_failure(body).as_deref(),
+            Some("/messages/0/role")
+        );
+    }
+
+    #[test]
+    fn structural_validation_accepts_legitimate_chat_bodies() {
+        // String content, multipart content arrays, tool calls, tool
+        // results, system — every shape rig's typed serialization produces.
+        let body = br#"{"messages":[
+            {"role":"system","content":"be helpful"},
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"ok"},
+            {"role":"user","content":[{"type":"text","text":"a"},{"type":"image","image_url":"data:image/png;base64,AAA"}]}
+        ]}"#;
+        assert_eq!(super::structural_validation_failure(body), None);
+    }
+
+    #[test]
+    fn structural_validation_skips_non_chat_bodies() {
+        // No `messages` field: embeddings / model listing / Responses `input`.
+        assert_eq!(super::structural_validation_failure(br#"{"input":"hi"}"#), None);
+        assert_eq!(super::structural_validation_failure(br#"[]"#), None);
+        assert_eq!(super::structural_validation_failure(b""), None);
+        assert_eq!(super::structural_validation_failure(br#"not json"#), None);
     }
 
     #[test]
