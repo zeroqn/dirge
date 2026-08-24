@@ -778,8 +778,8 @@ async fn no_skills_suppresses_the_preamble_catalog() {
     let prev_home = std::env::var_os("HOME");
     // SAFETY: guarded by HOME_LOCK; restored before the lock drops.
     unsafe { std::env::set_var("HOME", &home) };
-    let (_agent, _cache, _provider, preamble) =
-        build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
+    let (_agent, _cache, _provider, preamble, _lean) =
+        build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o", false).await;
     match prev_home {
         Some(h) => unsafe { std::env::set_var("HOME", h) },
         None => unsafe { std::env::remove_var("HOME") },
