@@ -792,6 +792,17 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         || lower.contains("timed out")
         || lower.contains("request timeout")
         || lower.contains("server error")
+        // OpenAI-compatible SSE error envelopes carry 500-class
+        // failures status-less (`ProviderResponseError: {json}` with
+        // `type: "server_error"` / `code: "internal_server_error"`),
+        // so the 5xx regex above never sees a number. The underscore
+        // forms are the envelope convention, not prose. Retryable
+        // like any other 5xx.
+        || lower.contains("server_error")
+        // Go/reqwest truncated-read report (`io.ErrUnexpectedEOF`):
+        // the connection died mid-body — the same transient class as
+        // the decode failures below.
+        || lower.contains("unexpected eof")
         // reqwest connect/send failures: the request never got a
         // response (connection refused/dropped, DNS, TCP connect, or
         // a mid-send drop). rig wraps these as "Http client error:
@@ -1124,6 +1135,19 @@ mod tests {
             ErrorKind::Network
         );
         assert_eq!(classify_error("decode error: EOF"), ErrorKind::Network);
+        // OpenAI-compatible SSE error envelope: a 500-class failure that
+        // arrives status-less (`ProviderResponseError: {json}`) — no 5xx
+        // number is visible, but the `server_error` markers must route it
+        // to Network so the retry layer reconnects instead of surfacing
+        // it as a one-shot `Other`.
+        assert_eq!(
+            classify_error(
+                r#"ProviderResponseError: {"error":{"message":"unexpected EOF","type":"server_error","code":"internal_server_error"}}"#
+            ),
+            ErrorKind::Network
+        );
+        // Bare Go/reqwest truncated-read report (`io.ErrUnexpectedEOF`).
+        assert_eq!(classify_error("unexpected EOF"), ErrorKind::Network);
 
         // B3-2: 5xx variants beyond the previous strict set.
         // Plain 500 (was previously falling through to Other).
