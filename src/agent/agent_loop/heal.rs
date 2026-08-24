@@ -14,13 +14,17 @@
 //! fail API validation.
 //!
 //! Reasonix's third repair — stamping an empty `reasoning_content` onto
-//! assistant turns that lack one — is deliberately NOT ported, and the
-//! claim that it was has been removed from this list. opencode carries an
-//! equivalent for DeepSeek, but only because its own transform lifts
-//! reasoning out of the message content, so it has to put an empty one
-//! back. Dirge replays the reasoning block as-is (see
-//! `rig_stream_factory::provider_rejects_reasoning_echo`), so there is
-//! nothing to restore; the DeepSeek and GLM live smoke tests cover it.
+//! assistant turns that lack one — is NOT ported here, but not because the
+//! requirement is imaginary: DeepSeek thinking mode 400s a tool-carrying
+//! request that replays an assistant turn without `reasoning_content` ("The
+//! `reasoning_content` in the thinking mode must be passed back to the API"),
+//! even when that turn produced no reasoning. Dirge satisfies it at the wire
+//! boundary instead — `CompressingHttpClient::stamp_deepseek_reasoning_content`
+//! fills the field on every DeepSeek assistant message that lacks it. The
+//! transcript deliberately keeps only the reasoning the model actually
+//! produced (`rig_stream_factory::provider_rejects_reasoning_echo`); the stamp
+//! is applied per request, so the transcript stays clean and the live loop and
+//! session resumes both get the field.
 
 use serde_json::Value;
 

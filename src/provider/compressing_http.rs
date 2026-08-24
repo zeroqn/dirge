@@ -141,7 +141,58 @@ impl<Inner> CompressingHttpClient<Inner> {
     /// accepts the same payload under `reasoning`. Renaming rather than
     /// dropping keeps the model's own reasoning in context across turns; this
     /// is what the `@ai-sdk/cerebras` provider does for opencode.
+    /// DeepSeek thinking mode requires `reasoning_content` to be echoed back on
+    /// every assistant message in a tool-carrying request, even on turns that
+    /// produced no reasoning — otherwise the API 400s with "The
+    /// `reasoning_content` in the thinking mode must be passed back to the
+    /// API." (api-docs.deepseek.com/guides/thinking_mode). rig only serializes
+    /// the field when a non-empty reasoning block exists, so an assistant turn
+    /// without one (no reasoning emitted, or an empty reasoning block) would
+    /// replay without the field. Stamp an empty string on those turns; real
+    /// reasoning is left exactly as rig wrote it.
+    fn stamp_deepseek_reasoning_content(&self, body: Bytes) -> Bytes {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        // The requirement applies only when the request carries `tools`
+        // (DeepSeek ignores the field otherwise). Agentic dirge requests
+        // always do; the guard keeps tool-less one-shots byte-identical.
+        if value.get("tools").is_none() {
+            return body;
+        }
+        let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            return body;
+        };
+        let mut stamped = false;
+        for message in messages {
+            let Some(object) = message.as_object_mut() else {
+                continue;
+            };
+            if object.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if object.contains_key("reasoning_content") {
+                continue;
+            }
+            object.insert(
+                "reasoning_content".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+            stamped = true;
+        }
+        if !stamped {
+            return body;
+        }
+        match serde_json::to_vec(&value) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(_) => body,
+        }
+    }
+
     fn rewrite_provider_quirks(&self, body: Bytes) -> Bytes {
+        if self.backend == Some(super::resolve::ProviderKind::DeepSeek) {
+            return self.stamp_deepseek_reasoning_content(body);
+        }
         if self.backend != Some(super::resolve::ProviderKind::Cerebras) {
             return body;
         }
@@ -558,6 +609,70 @@ mod tests {
     fn rename_passes_through_non_json_bodies() {
         let raw = Bytes::from_static(b"not json at all");
         assert_eq!(cerebras_client().rewrite_provider_quirks(raw.clone()), raw);
+    }
+
+    fn deepseek_client() -> CompressingHttpClient<()> {
+        CompressingHttpClient::<()>::default().with_backend(ProviderKind::DeepSeek)
+    }
+
+    /// DeepSeek thinking mode 400s a tool-carrying request that replays an
+    /// assistant turn without `reasoning_content` ("The `reasoning_content` in
+    /// the thinking mode must be passed back to the API"). rig omits the field
+    /// whenever the transcript turn has no non-empty thinking block, so stamp
+    /// an empty string on those turns.
+    #[test]
+    fn deepseek_stamps_empty_reasoning_content_on_assistant_turns() {
+        let out = rewrite(
+            &deepseek_client(),
+            serde_json::json!({"tools": [{"type":"function"}], "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"answer"},
+                {"role":"assistant","tool_calls":[{"id":"c1"}]},
+            ]}),
+        );
+        assert_eq!(out["messages"][1]["reasoning_content"], "");
+        assert_eq!(out["messages"][2]["reasoning_content"], "");
+        assert_eq!(out["messages"][0].get("reasoning_content").is_none(), true);
+    }
+
+    /// Real reasoning is preserved, not clobbered or duplicated.
+    #[test]
+    fn deepseek_keeps_existing_reasoning_content() {
+        let out = rewrite(
+            &deepseek_client(),
+            serde_json::json!({"tools": [{}], "messages": [
+                {"role":"assistant","content":"a","reasoning_content":"real thinking"},
+                {"role":"assistant","content":"b"},
+            ]}),
+        );
+        assert_eq!(out["messages"][0]["reasoning_content"], "real thinking");
+        assert_eq!(out["messages"][1]["reasoning_content"], "");
+    }
+
+    /// The stamp is scoped to the DeepSeek backend and to tool-carrying
+    /// requests; anything else must come back byte-identical.
+    #[test]
+    fn deepseek_stamp_is_scoped_and_tool_gated() {
+        let tooled = serde_json::json!({"tools": [{}], "messages": [
+            {"role":"assistant","content":"answer"},
+        ]});
+        // A non-DeepSeek backend does not stamp.
+        let other = rewrite(
+            &CompressingHttpClient::<()>::default().with_backend(ProviderKind::Custom),
+            tooled.clone(),
+        );
+        assert!(other["messages"][0].get("reasoning_content").is_none());
+
+        // Tool-less DeepSeek requests are untouched.
+        let tool_less = serde_json::json!({"messages": [
+            {"role":"assistant","content":"answer"},
+        ]});
+        let bytes = Bytes::from(tool_less.to_string());
+        assert_eq!(deepseek_client().rewrite_provider_quirks(bytes.clone()), bytes);
+
+        // DeepSeek non-JSON passes through like every other backend.
+        let raw = Bytes::from_static(b"not json at all");
+        assert_eq!(deepseek_client().rewrite_provider_quirks(raw.clone()), raw);
     }
 
     #[test]
