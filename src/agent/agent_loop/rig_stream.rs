@@ -634,7 +634,7 @@ where
                 // guessing at a block type for it.
                 Ok(StreamedAssistantContent::Unknown(_)) => {}
                 Err(err) => {
-                    let error_msg = err.to_string();
+                    let mut error_msg = err.to_string();
                     use crate::agent::recovery::classify_error;
                     let kind = classify_error(&error_msg);
                     // #711: log the provider's own message, not just the kind
@@ -643,6 +643,23 @@ where
                     // which limit); downstream it is reduced to a capped
                     // `failed: …` line, so dropping it here left mis-routed
                     // requests with no diagnostics anywhere.
+                    //
+                    // When the failing request was dumped (compressing_http
+                    // writes the exact wire bytes + tracing to a /tmp file on
+                    // validation trips and non-2xx responses), surface the file
+                    // path in the error itself so the user can open it right
+                    // away — for DeepSeek's `'str' object has no attribute
+                    // 'items'` 400001 this is the body the user asked about.
+                    // `take` clears the slot: the path belongs to this error,
+                    // not to a later unrelated failure.
+                    if let Some(dump) =
+                        crate::provider::compressing_http::take_last_failed_dump()
+                    {
+                        error_msg.push_str(&format!(
+                            "\n\n[dirge] failing request body + tracing dumped to: {}",
+                            dump.display()
+                        ));
+                    }
                     tracing::warn!(
                         target: "dirge::provider",
                         error_kind = %format!("{:?}", kind),

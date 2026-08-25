@@ -3,7 +3,10 @@ use futures::StreamExt;
 use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Render a request URI for logging with its query string removed. Some
 /// providers (notably Gemini, whose rig client builds `…?key=<API_KEY>`) carry
@@ -238,6 +241,12 @@ impl<Inner> CompressingHttpClient<Inner> {
     {
         let (parts, body) = req.into_parts();
         let original: Bytes = body.into();
+        tracing::trace!(
+            target: "dirge::provider",
+            bytes = original.len(),
+            body = %String::from_utf8_lossy(&original),
+            "original provider request body (pre-compression)",
+        );
         let mut wire = self.maybe_compress(original.clone());
         wire = self.rewrite_provider_quirks(wire);
         // Post-compression structural validation. rig's typed `Message`
@@ -251,20 +260,50 @@ impl<Inner> CompressingHttpClient<Inner> {
         // exonerated and the warn below is the upstream diagnosis (message
         // assembly, not llmtrim).
         if let Some(path) = structural_validation_failure(&wire) {
-            let fallback = self.rewrite_provider_quirks(original);
+            let fallback = self.rewrite_provider_quirks(original.clone());
             if structural_validation_failure(&fallback).is_none() {
                 tracing::warn!(
                     target: "dirge::compression",
                     bad = %path,
                     "compressed request body failed structural validation — sending the original uncompressed body instead"
                 );
+                // Capture the corrupted compressed body BEFORE the fallback
+                // overwrites it — this is the exact shape that would 400.
+                set_last_failed_dump(dump_failed_request(
+                    &parts.method.to_string(),
+                    &log_safe_uri(&parts.uri.to_string()),
+                    None,
+                    &format!(
+                        "compression corrupted the request shape at {path}; sent the original instead"
+                    ),
+                    None,
+                    &original,
+                    &wire,
+                ));
                 wire = fallback;
             } else {
                 tracing::warn!(
                     target: "dirge::provider",
                     bad = %path,
+                    body = %String::from_utf8_lossy(&wire),
                     "request body is structurally invalid even before compression — the 400 originates upstream of llmtrim, in message assembly"
                 );
+                // The original body is also flagged, but it's the best-known-good
+                // bytes (rig's typed serialization). Send it rather than the
+                // compressed (also flagged) body, so the failure is reproducible
+                // byte-for-byte and compression is not in the signal path.
+                set_last_failed_dump(dump_failed_request(
+                    &parts.method.to_string(),
+                    &log_safe_uri(&parts.uri.to_string()),
+                    None,
+                    &format!(
+                        "request shape invalid at {path} even before compression — the 400 originates upstream of llmtrim, in message assembly"
+                    ),
+                    None,
+                    &original,
+                    &wire,
+                ));
+                wire = fallback;
             }
         }
         let mut builder = Request::builder()
@@ -274,6 +313,12 @@ impl<Inner> CompressingHttpClient<Inner> {
         if let Some(headers) = builder.headers_mut() {
             *headers = parts.headers;
         }
+        tracing::trace!(
+            target: "dirge::provider",
+            bytes = wire.len(),
+            body = %String::from_utf8_lossy(&wire),
+            "sending provider request body",
+        );
         builder.body(wire).map_err(http_client::Error::Protocol)
     }
 }
@@ -308,6 +353,91 @@ fn structural_validation_failure(body: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Path of the most recent failed-request dump, consumed by the error
+/// surfacing layer (`rig_stream.rs`) so the user can find the exact wire bytes
+/// behind a 4xx. Set on every request failure / structural-validation trip;
+/// cleared when a request succeeds so a later unrelated error never picks up a
+/// stale path.
+static LAST_FAILED_DUMP: Mutex<Option<PathBuf>> = Mutex::new(None);
+static DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn set_last_failed_dump(path: Option<PathBuf>) {
+    *LAST_FAILED_DUMP.lock().unwrap() = path;
+}
+
+/// Take (and clear) the path of the most recent failed-request dump. The error
+/// surfacing layer appends it to the message the user sees.
+pub(crate) fn take_last_failed_dump() -> Option<PathBuf> {
+    LAST_FAILED_DUMP.lock().unwrap().take()
+}
+
+/// Write the exact wire bytes of a failed provider request plus tracing
+/// metadata to a temp file under the system temp dir (`/tmp`), so the failing
+/// body can be inspected or replayed after the run. `original` is the body as
+/// rig serialized it (pre-compression); `wire` is what was (or would have
+/// been) sent. Returns the written file path, or `None` when the dump could
+/// not be written (in which case the failure is only logged).
+fn dump_failed_request(
+    method: &str,
+    uri: &str,
+    status: Option<u16>,
+    note: &str,
+    response_error: Option<&str>,
+    original: &[u8],
+    wire: &[u8],
+) -> Option<PathBuf> {
+    let seq = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "dirge-request-{millis}-{}-{seq}.json",
+        std::process::id()
+    ));
+    let payload = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "pid": std::process::id(),
+        "method": method,
+        "uri": uri,
+        "status": status,
+        "note": note,
+        "provider_error": response_error.map(|s| s.chars().take(2000).collect::<String>()),
+        "original_body": json_value_or_string(original),
+        "wire_body": json_value_or_string(wire),
+    });
+    match serde_json::to_string_pretty(&payload)
+        .ok()
+        .and_then(|json| std::fs::write(&path, json).ok())
+    {
+        Some(()) => {
+            tracing::warn!(
+                target: "dirge::provider",
+                dump = %path.display(),
+                "failed provider request dumped to {}",
+                path.display()
+            );
+            Some(path)
+        }
+        None => {
+            tracing::warn!(
+                target: "dirge::provider",
+                path = %path.display(),
+                "could not write failed-request dump"
+            );
+            None
+        }
+    }
+}
+
+/// The body may or may not parse as JSON (non-chat requests, empty bodies) —
+/// keep it inspectable either way.
+fn json_value_or_string(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).unwrap_or_else(|_| {
+        serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+    })
 }
 
 /// Outcome of a [`StreamingWithHeaders`] send: the rig-shaped result, plus the
@@ -366,6 +496,9 @@ fn reqwest_streaming_with_headers(
     let client = client.clone();
     Box::pin(async move {
         let (parts, body) = req.into_parts();
+        let method = parts.method.to_string();
+        let uri = log_safe_uri(&parts.uri.to_string());
+        let body_bytes = body.clone();
         let built = client
             .request(parts.method, parts.uri.to_string())
             .headers(parts.headers)
@@ -400,6 +533,19 @@ fn reqwest_streaming_with_headers(
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+            // Dump the exact wire bytes that produced the rejection; the error
+            // surfacing layer appends the file path to the message the user
+            // sees (e.g. DeepSeek's 400001 'str' object has no attribute
+            // 'items').
+            set_last_failed_dump(dump_failed_request(
+                &method,
+                &uri,
+                Some(status.as_u16()),
+                "provider returned a non-2xx streaming response",
+                Some(&message),
+                &body_bytes,
+                &body_bytes,
+            ));
             return StreamingSend {
                 result: Err(http_client::Error::InvalidStatusCodeWithMessage(
                     status, message,
@@ -448,6 +594,7 @@ where
             let method = req.method().to_string();
             let uri = log_safe_uri(&req.uri().to_string());
             let endpoint = endpoint_key(req.uri());
+            let body_bytes = req.body().clone();
             // GH #718: the provider already told us this window is empty.
             // Sending anyway is a guaranteed 429 that still counts against
             // the quota — which is how the reporter's daily allowance was
@@ -469,10 +616,25 @@ where
                     // only place providers which report their limits ONLY
                     // in headers (Anthropic, OpenAI, Groq) are visible to
                     // us at all, since rig's error conversion drops them.
+                    if !resp.status().is_success() {
+                        // rig converts this into the `HttpError: Invalid status
+                        // code …` the user sees; dump the exact wire bytes that
+                        // produced it so the failing body can be inspected.
+                        set_last_failed_dump(dump_failed_request(
+                            &method,
+                            &uri,
+                            Some(resp.status().as_u16()),
+                            "provider returned a non-2xx response",
+                            None,
+                            &body_bytes,
+                            &body_bytes,
+                        ));
+                    }
                     if resp.status() == http::StatusCode::TOO_MANY_REQUESTS {
                         super::rate_limit_gate::note_from_headers(&endpoint, resp.headers());
                     } else if resp.status().is_success() {
                         super::rate_limit_gate::clear(&endpoint);
+                        set_last_failed_dump(None);
                     }
                     tracing::debug!(
                         method = %method,
@@ -483,6 +645,7 @@ where
                 }
                 Err(e) => {
                     super::rate_limit_gate::note_from_error(&endpoint, &e.to_string());
+                    set_last_failed_dump(None);
                     tracing::debug!(
                         method = %method,
                         uri = %uri,
@@ -532,6 +695,10 @@ where
             match &result {
                 Ok(_) => {
                     super::rate_limit_gate::clear(&endpoint);
+                    // The streaming path sets the slot inside
+                    // `reqwest_streaming_with_headers` on non-2xx; a 2xx means
+                    // there is nothing to dump, so drop any stale path.
+                    set_last_failed_dump(None);
                     tracing::debug!(
                         method = %method,
                         uri = %uri,
@@ -1216,5 +1383,63 @@ mod tests {
             collected.extend_from_slice(&chunk.expect("chunk must decode"));
         }
         assert_eq!(collected.as_slice(), &payload[..]);
+    }
+
+    /// A non-2xx streaming response must dump the exact wire bytes + tracing
+    /// metadata to a temp file and make the path available via
+    /// `take_last_failed_dump` so the error surfacing layer can append it.
+    #[tokio::test]
+    async fn non_2xx_streaming_dumps_the_request_body() {
+        let _serialized = LOOPBACK_SERVER.lock().await;
+        let url = serve_once(
+            "400 Bad Request",
+            &[("content-type", "application/json")],
+            br#"{"error":{"message":"invalid input messages format. 'str' object has no attribute 'items'","code":"400001"}}"#,
+        )
+        .await;
+
+        let c = client_reqwest();
+        let msg = match c.send_streaming(request_to_url(&url)).await {
+            Ok(_) => panic!("a 400 must surface as an error"),
+            Err(e) => e.to_string(),
+        };
+
+        // The dump path must have been recorded.
+        let dump = super::take_last_failed_dump()
+            .expect("a non-2xx streaming response must dump the request body");
+
+        // The file must exist and contain the expected metadata.
+        let contents = std::fs::read_to_string(&dump).expect("dump file must be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).expect("dump file must be valid JSON");
+        assert_eq!(parsed["status"], 400, "dump must report the HTTP status");
+        assert_eq!(parsed["method"], "POST", "dump must report the method");
+        assert!(parsed["uri"].as_str().unwrap().contains("127.0.0.1"));
+        assert_eq!(
+            parsed["wire_body"], serde_json::json!({}),
+            "dump must contain the raw request body"
+        );
+        assert!(
+            parsed["provider_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid input messages format"),
+            "dump must contain the provider error text: {parsed}"
+        );
+        assert_eq!(
+            parsed["note"],
+            "provider returned a non-2xx streaming response",
+            "dump must contain the correct note"
+        );
+
+        // The error message itself must NOT contain the dump path yet (the
+        // append happens in rig_stream, not in the HTTP client).
+        assert!(
+            !msg.contains("dirge-request-"),
+            "the raw streaming error must not contain the dump path: {msg}"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&dump);
     }
 }
