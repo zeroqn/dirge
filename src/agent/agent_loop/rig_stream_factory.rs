@@ -902,6 +902,24 @@ fn stamp_thinking_signature_model(mut evt: StreamEvent, model_name: Option<&str>
     evt
 }
 
+/// Sanitize a tool-call `arguments` value at the provider boundary.
+///
+/// A well-formed JSON object passes through unchanged; a string that
+/// decodes to an object is normalized to that object (the well-formed
+/// single-encoded case); anything else — double-encoded string, bare
+/// string, invalid JSON, null, array, scalar — becomes `{}` so a
+/// structurally invalid tool call can never reach the wire and crash
+/// the provider's message validator (`json.loads(arguments).items()`).
+fn sanitize_tool_arguments(arguments: Value) -> Value {
+    match arguments {
+        Value::String(s) => serde_json::from_str::<Value>(&s)
+            .ok()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({})),
+        value @ Value::Object(_) => value,
+        _ => serde_json::json!({}),
+    }
+}
 /// Convert one assistant content block to a rig `AssistantContent`.
 /// Recognizes `{type: "text"|"thinking"|"toolCall", ...}`.
 fn value_to_assistant_content(
@@ -968,7 +986,8 @@ fn value_to_assistant_content(
         "toolCall" => {
             let id = obj.get("id").and_then(|t| t.as_str())?.to_string();
             let name = obj.get("name").and_then(|t| t.as_str())?.to_string();
-            let arguments = obj.get("arguments").cloned().unwrap_or(Value::Null);
+            let arguments =
+                sanitize_tool_arguments(obj.get("arguments").cloned().unwrap_or(Value::Null));
             Some(AssistantContent::ToolCall(ToolCall {
                 call_id: synthesize_call_id.then(|| id.clone()),
                 id,
@@ -1501,6 +1520,88 @@ mod tests {
                 _ => panic!("expected ToolCall"),
             },
             _ => panic!("expected Assistant"),
+        }
+    }
+
+    /// DeepSeek 400001 `'str' object has no attribute 'items'`: a tool call
+    /// whose `arguments` reached history as a double-encoded JSON string (the
+    /// model emitted a JSON string literal whose decoded content is not even a
+    /// JSON object). Replayed verbatim, rig's `stringified_json::serialize`
+    /// would put `"\"{\\\"todos\\\"...\""` on the wire and the provider's
+    /// `json.loads(arguments).items()` crashes on the str. The provider
+    /// boundary must sanitize it to `{}` instead.
+    #[test]
+    fn assistant_tool_call_with_double_encoded_arguments_sanitizes_to_empty_object() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_1",
+                "name": "write_todo_list",
+                "arguments": r#""{\"todos\": [9]{content,priority,status}}""#,
+            }],
+        });
+        let msg = value_to_rig_message(&v).expect("must convert");
+        match msg {
+            Message::Assistant { content, .. } => match content.first() {
+                AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.function.arguments, serde_json::json!({}));
+                }
+                _ => panic!("expected ToolCall"),
+            },
+            _ => panic!("expected Assistant"),
+        }
+    }
+
+    /// A tool call whose `arguments` is a plain JSON-stringified object (the
+    /// OpenAI-style shape some code paths keep in history) normalizes to the
+    /// parsed object — the same wire bytes as before.
+    #[test]
+    fn assistant_tool_call_with_stringified_object_arguments_normalizes() {
+        let v = serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call_1",
+                "name": "read",
+                "arguments": r#"{"path": "/tmp/x"}"#,
+            }],
+        });
+        let msg = value_to_rig_message(&v).expect("must convert");
+        match msg {
+            Message::Assistant { content, .. } => match content.first() {
+                AssistantContent::ToolCall(tc) => {
+                    assert_eq!(tc.function.arguments, serde_json::json!({"path": "/tmp/x"}));
+                }
+                _ => panic!("expected ToolCall"),
+            },
+            _ => panic!("expected Assistant"),
+        }
+    }
+
+    /// Every other malformed `arguments` shape — null, bare string, invalid
+    /// JSON, number, array, stringified string — sanitizes to `{}`; a real
+    /// object passes through untouched.
+    #[test]
+    fn sanitize_tool_arguments_normalizes_every_wire_shape() {
+        let obj = serde_json::json!({"limit": 30});
+        assert_eq!(sanitize_tool_arguments(obj.clone()), obj);
+
+        let stringified = serde_json::json!(r#"{"limit": 30}"#);
+        assert_eq!(sanitize_tool_arguments(stringified), obj);
+
+        for poisoned in [
+            serde_json::json!(null),
+            serde_json::json!("not json"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2]),
+            serde_json::json!(r#""hi""#),
+        ] {
+            assert_eq!(
+                sanitize_tool_arguments(poisoned.clone()),
+                serde_json::json!({}),
+                "poisoned args: {poisoned}",
+            );
         }
     }
 
