@@ -24,7 +24,7 @@ stdenv.mkDerivation {
     url = "https://github.com/${repo}/releases/download/${tag}/dirge-${triple}-sandbox.tar.gz";
     # Hash of the artifact uploaded by the last ds-sandbox workflow run;
     # rewritten by .github/workflows/release-sandbox.yml after each upload.
-    hash = "sha256-HTG7pei6I+TaWIFjpzA+uTMITKvyuW85IpXDqXvhkq4=";
+    hash = "sha256-Bo72wotCZ4g1te3/VTQ1w1gYBpd9cmxwhfV699r3/6w=";
   };
 
   nativeBuildInputs = lib.optionals stdenv.isLinux [ autoPatchelfHook ];
